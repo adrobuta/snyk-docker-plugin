@@ -1,9 +1,12 @@
 import { legacy } from "@snyk/dep-graph";
-import * as path from "path";
+import * as resolveNodeDeps from 'snyk-resolve-deps';
 import * as lockFileParser from "snyk-nodejs-lockfile-parser";
 import { DepGraphFact, TestedFilesFact } from "../../facts";
+import { groupFilesByDirectory, persistAppNodeModules, cleanupAppNodeModules } from "./node-modules-utils";
+import { AppDepsScanResultWithoutTarget, FilePathToContent , FilesByDir } from "./types";
+import * as path from "path";
 
-import { AppDepsScanResultWithoutTarget, FilePathToContent } from "./types";
+const asTree = require('snyk-tree');
 
 interface ManifestLockPathPair {
   manifest: string;
@@ -14,8 +17,6 @@ interface ManifestLockPathPair {
 export async function nodeFilesToScannedProjects(
   filePathToContent: FilePathToContent,
 ): Promise<AppDepsScanResultWithoutTarget[]> {
-  const scanResults: AppDepsScanResultWithoutTarget[] = [];
-
   /**
    * TODO: Add support for Yarn workspaces!
    * https://github.com/snyk/nodejs-lockfile-parser/blob/af8ba81930e950156b539281ecf41c1bc63dacf4/test/lib/yarn-workflows.test.ts#L7-L17
@@ -26,12 +27,48 @@ export async function nodeFilesToScannedProjects(
    * };
    */
 
-  const filePairs = findManifestLockPairsInSameDirectory(filePathToContent);
+  const fileNamesGroupedByDirectory = groupFilesByDirectory(filePathToContent);
+  const manifestFilePairs = findManifestLockPairsInSameDirectory(fileNamesGroupedByDirectory);
 
+  if (manifestFilePairs.length === 0) {
+    return depGraphFromNodeModules(filePathToContent, fileNamesGroupedByDirectory)
+  } else {
+    return depGraphFromManifestFiles(filePathToContent, manifestFilePairs)
+  }
+  return [];
+}
+
+async function depGraphFromNodeModules(
+  filePathToContent: FilePathToContent,
+  fileNamesGroupedByDirectory: FilesByDir
+): Promise<AppDepsScanResultWithoutTarget[]> 
+{
+  const scanResults: AppDepsScanResultWithoutTarget[] = [];
+
+  const [appRootPath, appRootDir] = await persistAppNodeModules(filePathToContent, fileNamesGroupedByDirectory);
+
+  resolveNodeDeps(appRootDir, {dev: true }).then(function (tree) {
+    console.log(asTree(tree));
+  }).catch(function (error) {
+    // error is usually limited to unknown directory
+    console.log(error.stack);
+    process.exit(1);
+  });
+
+  cleanupAppNodeModules(appRootPath);
+  return scanResults;
+}
+
+async function depGraphFromManifestFiles(
+  filePathToContent: FilePathToContent,
+  manifestFilePairs: ManifestLockPathPair[]
+): Promise<AppDepsScanResultWithoutTarget[]> 
+{
+  const scanResults: AppDepsScanResultWithoutTarget[] = [];
   const shouldIncludeDevDependencies = false;
   const shouldBeStrictForManifestAndLockfileOutOfSync = false;
 
-  for (const pathPair of filePairs) {
+  for (const pathPair of manifestFilePairs) {
     // TODO: initially generate as DepGraph
     const parserResult = await lockFileParser.buildDepTree(
       filePathToContent[pathPair.manifest],
@@ -64,17 +101,18 @@ export async function nodeFilesToScannedProjects(
       },
     });
   }
-
   return scanResults;
 }
 
 function findManifestLockPairsInSameDirectory(
-  filePathToContent: FilePathToContent,
+  fileNamesGroupedByDirectory: FilesByDir,
 ): ManifestLockPathPair[] {
-  const fileNamesGroupedByDirectory = groupFilesByDirectory(filePathToContent);
   const manifestLockPathPairs: ManifestLockPathPair[] = [];
 
   for (const directoryPath of Object.keys(fileNamesGroupedByDirectory)) {
+    if (directoryPath.includes("node_modules")) {
+      continue;
+    }
     const filesInDirectory = fileNamesGroupedByDirectory[directoryPath];
     if (filesInDirectory.length !== 2) {
       // either a missing file or too many files, ignore
@@ -105,22 +143,6 @@ function findManifestLockPairsInSameDirectory(
   }
 
   return manifestLockPathPairs;
-}
-
-// assumption: we only care about manifest+lock files if they are in the same directory
-function groupFilesByDirectory(filePathToContent: FilePathToContent): {
-  [directoryName: string]: string[];
-} {
-  const fileNamesGroupedByDirectory: { [directoryName: string]: string[] } = {};
-  for (const filePath of Object.keys(filePathToContent)) {
-    const directory = path.dirname(filePath);
-    const fileName = path.basename(filePath);
-    if (!fileNamesGroupedByDirectory[directory]) {
-      fileNamesGroupedByDirectory[directory] = [];
-    }
-    fileNamesGroupedByDirectory[directory].push(fileName);
-  }
-  return fileNamesGroupedByDirectory;
 }
 
 function stripUndefinedLabels(
